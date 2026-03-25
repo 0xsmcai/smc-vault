@@ -154,7 +154,6 @@ contract SMCVault {
 
         // Calculate shares based on current NAV
         uint256 totalWeth = totalWethAssets();
-        uint256 totalTokenAssets_ = token.balanceOf(address(this));
 
         if (totalShares == INITIAL_SHARES) {
             // First real deposit — shares = wethAmount (1:1)
@@ -183,12 +182,13 @@ contract SMCVault {
         if (shareAmount == 0) revert ZeroAmount();
         if (shares[msg.sender] < shareAmount) revert InsufficientShares();
 
-        // Calculate proportional amounts
+        // Collect performance fee BEFORE calculating owed amounts
+        // so wethOwed reflects post-fee asset values
+        _collectPerformanceFee();
+
+        // Calculate proportional amounts (after fee collection)
         uint256 wethOwed = (shareAmount * totalWethAssets()) / totalShares;
         uint256 tokenOwed = (shareAmount * token.balanceOf(address(this))) / totalShares;
-
-        // Collect performance fee before withdrawal
-        _collectPerformanceFee();
 
         // Burn shares
         shares[msg.sender] -= shareAmount;
@@ -329,13 +329,15 @@ contract SMCVault {
         // Transfer all WETH to owner
         uint256 wethBal = weth.balanceOf(address(this));
         if (wethBal > 0) {
-            weth.transfer(owner, wethBal);
+            bool wethSuccess = weth.transfer(owner, wethBal);
+            if (!wethSuccess) revert TransferFailed();
         }
 
         // Transfer all tokens to owner
         uint256 tokenBal = token.balanceOf(address(this));
         if (tokenBal > 0) {
-            token.transfer(owner, tokenBal);
+            bool tokenSuccess = token.transfer(owner, tokenBal);
+            if (!tokenSuccess) revert TransferFailed();
         }
 
         emit EmergencyWithdrawExecuted(msg.sender);
