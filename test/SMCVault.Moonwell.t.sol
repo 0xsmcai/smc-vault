@@ -173,11 +173,10 @@ contract SMCVaultMoonwellTest is Test {
     function test_08_SupplyMintFailsReverts() public {
         _deposit(depositor1, 0.02 ether, 100e18);
 
-        // Pause after the guardian check passes by making mint fail differently
-        // We use mintGuardianPaused which makes mint() return 1
-        moonwell.setMintGuardianPaused(true);
+        // Force mint() to return error code 2 (guardian check passes, mint itself fails)
+        moonwell.setForceMintFail(true);
 
-        vm.expectRevert(SMCVault.MoonwellMintGuardianPaused.selector);
+        vm.expectRevert(abi.encodeWithSelector(SMCVault.MoonwellMintFailed.selector, uint256(2)));
         vm.prank(operator);
         vault.supplyToMoonwell(0.01 ether);
     }

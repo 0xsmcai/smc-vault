@@ -12,6 +12,7 @@ contract MockMoonwell {
     uint256 public exchangeRateStored = 1e18; // 1:1 initially
     bool public mintGuardianPaused;
     bool public forceRedeemFail;
+    bool public forceMintFail;
     uint256 public totalMTokens;
 
     constructor(address _underlying) {
@@ -20,6 +21,7 @@ contract MockMoonwell {
 
     function mint(uint256 mintAmount) external returns (uint256) {
         if (mintGuardianPaused) return 1; // Error code
+        if (forceMintFail) return 2; // Non-zero error code (different from guardian pause)
         underlying.transferFrom(msg.sender, address(this), mintAmount);
         uint256 mTokens = (mintAmount * 1e18) / exchangeRateStored;
         balanceOf[msg.sender] += mTokens;
@@ -62,5 +64,9 @@ contract MockMoonwell {
 
     function setForceRedeemFail(bool fail) external {
         forceRedeemFail = fail;
+    }
+
+    function setForceMintFail(bool fail) external {
+        forceMintFail = fail;
     }
 }
