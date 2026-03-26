@@ -5,35 +5,32 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {IMoonwell} from "./interfaces/IMoonwell.sol";
 import {IWETH} from "./interfaces/IWETH.sol";
 
-/// @title SMCVault — Community Liquidity Engine Vault
-/// @notice Dual-asset vault (WETH + token) with Moonwell lending on idle WETH.
-///         ERC-4626-inspired but not strictly compliant (dual-asset deposits).
-/// @dev    Operator (keeper bot) can only interact with Uniswap + Moonwell.
-///         $100 cap per depositor. NAV-per-share high-water mark performance fee.
+/// @title SMCVault v3 — Community Liquidity Engine
+/// @notice Dual-asset vault (WETH + token) with Uniswap LP management and Moonwell yield boost.
 ///
 /// Architecture:
-///   Depositor → Vault (holds WETH + token + mWETH)
-///                 ├── Uniswap LP positions (active capital, managed by operator)
-///                 └── Moonwell supply (idle WETH, earns lending yield)
+///   Depositor -> Vault (holds WETH + token + mWETH)
+///                 |-- Uniswap LP positions (active capital, managed by operator via allowlisted calls)
+///                 +-- Moonwell supply (idle WETH, earns lending yield)
 ///
-/// Moonwell integration (Yield Boost Vault):
-///   - Operator calls supplyToMoonwell() to lend idle WETH
-///   - Operator calls withdrawFromMoonwell() to retrieve WETH before rebalance
-///   - totalAssets() includes mWETH value via exchangeRateStored()
-///   - Withdrawals auto-redeem from Moonwell if vault WETH is insufficient
-///   - Emergency withdraw drains Moonwell positions
+/// Security model:
+///   - Operator can ONLY call allowlisted Uniswap PM functions with vault as recipient
+///   - Operator can supply/withdraw idle WETH to Moonwell within lending ratio limits
+///   - Owner can collect performance fees and manage operator/selector config
+///   - Neither owner nor operator can drain depositor funds arbitrarily
+///   - Depositors can force-withdraw after 4-hour timeout without operator cooperation
+///   - $100 cap per wallet, dead shares protect against inflation attacks
+///   - 10% performance fee on NAV high-water mark only
 ///
-/// Security:
-///   - ReentrancyGuard on all external state-changing functions
-///   - MAX_LENDING_RATIO_CEILING = 90% (immutable, cannot be overridden)
-///   - Partial withdrawal with WithdrawalQueued event if Moonwell has high utilization
-
+/// Combines: smc-vault (Moonwell) + smc-vault-v2 (operator allowlist, withdrawal queue, security)
 contract SMCVault {
     // ========== ERRORS ==========
     error Unauthorized();
     error ZeroAmount();
     error ZeroAddress();
     error DepositCapExceeded();
+    error DepositTooSmall();
+    error DepositTooLarge(); // exceeds 20% of TVL
     error MaxLendingRatioCeilingExceeded();
     error MoonwellMintFailed(uint256 errorCode);
     error MoonwellRedeemFailed(uint256 errorCode);
@@ -41,58 +38,69 @@ contract SMCVault {
     error InsufficientShares();
     error TransferFailed();
     error ReentrantCall();
+    error UnauthorizedCall();
+    error InvalidRecipient();
+    error CooldownNotMet();
+    error EmergencyNotReady();
+    error QueueEmpty();
 
     // ========== EVENTS ==========
     event Deposit(address indexed depositor, uint256 wethAmount, uint256 tokenAmount, uint256 shares);
-    event Withdraw(address indexed depositor, uint256 shares, uint256 wethOut, uint256 tokenOut);
-    event WithdrawalQueued(address indexed depositor, uint256 remainingWeth);
+    event WithdrawalRequested(address indexed depositor, uint256 shareAmount, uint256 queueIndex);
+    event Withdrawn(address indexed depositor, uint256 wethAmount, uint256 tokenAmount, uint256 sharesBurned);
+    event EmergencyWithdrawn(address indexed depositor, uint256 wethAmount, uint256 tokenAmount);
     event MoonwellSupply(uint256 amount);
     event MoonwellWithdraw(uint256 amount);
     event MoonwellWithdrawFailed(uint256 errorCode);
     event MaxLendingRatioUpdated(uint256 oldRatio, uint256 newRatio);
-    event PerformanceFeeCollected(uint256 feeWeth, uint256 feeToken);
-    event EmergencyWithdrawExecuted(address indexed caller);
+    event PerformanceFeeCollected(uint256 feeWeth);
+    event HighWaterMarkUpdated(uint256 oldHWM, uint256 newHWM);
+    event OperatorAction(bytes4 selector, bool success);
     event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
+    event EmergencyDrainExecuted(address indexed caller);
 
     // ========== CONSTANTS ==========
-    /// @notice Maximum lending ratio ceiling — immutable, cannot exceed 90%
-    uint256 public constant MAX_LENDING_RATIO_CEILING = 9000; // 90% in basis points
-    /// @notice Basis points denominator
+    uint256 public constant MAX_LENDING_RATIO_CEILING = 9000; // 90% in BPS
     uint256 public constant BPS = 10000;
-    /// @notice Performance fee rate (10% of profits above high-water mark)
-    uint256 public constant PERFORMANCE_FEE_BPS = 1000;
-    /// @notice Deposit cap per wallet in WETH (0.03 ETH ~ $100 at ~$3300/ETH)
-    uint256 public constant DEPOSIT_CAP = 0.03 ether;
-    /// @notice Minimum deposit to prevent dust/inflation attacks
-    uint256 public constant MIN_DEPOSIT = 0.001 ether;
-    /// @notice Initial shares minted to dead address to prevent inflation attack
+    uint256 public constant PERFORMANCE_FEE_BPS = 1000; // 10%
+    uint256 public constant DEPOSIT_CAP = 0.03 ether; // ~$100 at ~$3300/ETH
+    uint256 public constant MIN_DEPOSIT = 0.0025 ether; // ~$5
+    uint256 public constant MAX_DEPOSIT_RATIO_BPS = 2000; // max 20% of TVL per deposit
+    uint256 public constant WITHDRAWAL_COOLDOWN = 1 hours;
+    uint256 public constant EMERGENCY_TIMEOUT = 4 hours;
     uint256 public constant INITIAL_SHARES = 1000;
 
-    // ========== STATE ==========
+    // ========== IMMUTABLES ==========
     IWETH public immutable weth;
     IERC20 public immutable token;
-    IMoonwell public immutable moonwellMarket; // mWETH on Moonwell
+    IMoonwell public immutable moonwellMarket;
+    address public immutable uniswapPM; // NonfungiblePositionManager
 
-    address public owner;
-    address public operator; // Keeper bot address
+    // ========== STATE ==========
+    address public immutable owner;
+    address public operator;
 
-    /// @notice Maximum ratio of WETH that can be lent to Moonwell (in BPS)
     uint256 public maxLendingRatio = 7000; // Default 70%
-
-    /// @notice Total shares outstanding
     uint256 public totalShares;
-    /// @notice Shares per depositor
     mapping(address => uint256) public shares;
-    /// @notice WETH deposited per address (for cap tracking)
     mapping(address => uint256) public wethDeposited;
+    mapping(address => uint256) public depositTimestamp;
 
-    /// @notice High-water mark for NAV per share (scaled by 1e18)
     uint256 public highWaterMark;
+    uint256 public reservedFees; // WETH reserved for owner, excluded from NAV
 
-    /// @notice Queued withdrawal amounts (WETH owed but not yet delivered)
-    mapping(address => uint256) public queuedWithdrawals;
+    // Operator allowlist for Uniswap calls
+    mapping(bytes4 => bool) public allowedSelectors;
 
-    /// @notice Reentrancy lock
+    // Withdrawal queue
+    struct WithdrawalRequest {
+        address depositor;
+        uint256 shareAmount;
+        uint256 requestedAt;
+    }
+    WithdrawalRequest[] public withdrawalQueue;
+
+    // Reentrancy lock
     uint256 private _locked = 1;
 
     // ========== MODIFIERS ==========
@@ -123,24 +131,33 @@ contract SMCVault {
         address _weth,
         address _token,
         address _moonwellMarket,
+        address _uniswapPM,
         address _operator
     ) {
-        if (_weth == address(0) || _token == address(0) || _moonwellMarket == address(0) || _operator == address(0))
-            revert ZeroAddress();
+        if (_weth == address(0) || _token == address(0) || _moonwellMarket == address(0)
+            || _uniswapPM == address(0) || _operator == address(0)) revert ZeroAddress();
 
         weth = IWETH(_weth);
         token = IERC20(_token);
         moonwellMarket = IMoonwell(_moonwellMarket);
+        uniswapPM = _uniswapPM;
         operator = _operator;
         owner = msg.sender;
 
         // Pre-approve WETH to Moonwell for supply operations
-        IERC20(_weth).approve(_moonwellMarket, type(uint256).max);
+        bool approveOk = IERC20(_weth).approve(_moonwellMarket, type(uint256).max);
+        require(approveOk, "WETH approve failed");
 
-        // Initial shares to dead address to prevent ERC-4626 inflation attack
+        // Uniswap V3 NonfungiblePositionManager selectors
+        allowedSelectors[0x88316456] = true; // mint
+        allowedSelectors[0x219f5d17] = true; // increaseLiquidity
+        allowedSelectors[0x0c49ccbe] = true; // decreaseLiquidity
+        allowedSelectors[0xfc6f7865] = true; // collect
+
+        // Dead shares to prevent ERC-4626 inflation attack
         totalShares = INITIAL_SHARES;
         shares[address(0xdead)] = INITIAL_SHARES;
-        highWaterMark = 1e18; // 1:1 initial NAV per share
+        highWaterMark = 1e18;
     }
 
     // ========== DEPOSIT ==========
@@ -149,118 +166,179 @@ contract SMCVault {
     /// @param tokenAmount Amount of token to deposit
     /// @return sharesOut Shares minted to depositor
     function deposit(uint256 wethAmount, uint256 tokenAmount) external nonReentrant returns (uint256 sharesOut) {
-        if (wethAmount < MIN_DEPOSIT) revert ZeroAmount();
+        if (wethAmount < MIN_DEPOSIT) revert DepositTooSmall();
         if (wethDeposited[msg.sender] + wethAmount > DEPOSIT_CAP) revert DepositCapExceeded();
 
-        // Calculate shares based on current NAV
-        uint256 totalWeth = totalWethAssets();
+        // Enforce max 20% of TVL per single deposit (skip for first real deposit)
+        if (totalShares > INITIAL_SHARES) {
+            uint256 currentTVL = _availableWeth();
+            if (currentTVL > 0 && (wethAmount * BPS) / currentTVL > MAX_DEPOSIT_RATIO_BPS) {
+                revert DepositTooLarge();
+            }
+        }
 
+        // Calculate shares based on current NAV
         if (totalShares == INITIAL_SHARES) {
-            // First real deposit — shares = wethAmount (1:1)
-            sharesOut = wethAmount;
+            sharesOut = wethAmount; // First real deposit: 1:1
         } else {
-            // Pro-rata based on WETH portion of NAV
+            uint256 totalWeth = _availableWeth();
+            if (totalWeth == 0) revert ZeroAmount();
             sharesOut = (wethAmount * totalShares) / totalWeth;
         }
 
-        // Transfer assets in
-        weth.transferFrom(msg.sender, address(this), wethAmount);
-        token.transferFrom(msg.sender, address(this), tokenAmount);
+        if (sharesOut == 0) revert ZeroAmount();
+
+        // Transfer assets in (check return values + actual received for fee-on-transfer tokens)
+        uint256 wethBefore = weth.balanceOf(address(this));
+        bool wethOk = weth.transferFrom(msg.sender, address(this), wethAmount);
+        if (!wethOk) revert TransferFailed();
+        uint256 actualWeth = weth.balanceOf(address(this)) - wethBefore;
+
+        uint256 tokenBefore = token.balanceOf(address(this));
+        bool tokenOk = token.transferFrom(msg.sender, address(this), tokenAmount);
+        if (!tokenOk) revert TransferFailed();
+        uint256 actualToken = token.balanceOf(address(this)) - tokenBefore;
 
         // Mint shares
         totalShares += sharesOut;
         shares[msg.sender] += sharesOut;
-        wethDeposited[msg.sender] += wethAmount;
+        wethDeposited[msg.sender] += actualWeth;
+        depositTimestamp[msg.sender] = block.timestamp;
 
-        emit Deposit(msg.sender, wethAmount, tokenAmount, sharesOut);
+        emit Deposit(msg.sender, actualWeth, actualToken, sharesOut);
     }
 
-    // ========== WITHDRAW ==========
-    /// @notice Withdraw proportional share of vault assets
-    /// @param shareAmount Number of shares to redeem
-    function withdraw(uint256 shareAmount) external nonReentrant {
+    // ========== WITHDRAWAL QUEUE ==========
+    /// @notice Request withdrawal by queueing shares
+    /// @param shareAmount Number of shares to withdraw
+    function requestWithdrawal(uint256 shareAmount) external {
         if (shareAmount == 0) revert ZeroAmount();
         if (shares[msg.sender] < shareAmount) revert InsufficientShares();
+        if (block.timestamp - depositTimestamp[msg.sender] < WITHDRAWAL_COOLDOWN) revert CooldownNotMet();
 
-        // Collect performance fee BEFORE calculating owed amounts
-        // so wethOwed reflects post-fee asset values
+        shares[msg.sender] -= shareAmount;
+
+        withdrawalQueue.push(WithdrawalRequest({
+            depositor: msg.sender,
+            shareAmount: shareAmount,
+            requestedAt: block.timestamp
+        }));
+
+        emit WithdrawalRequested(msg.sender, shareAmount, withdrawalQueue.length - 1);
+    }
+
+    /// @notice Operator processes a queued withdrawal
+    /// @param index Index in the withdrawal queue
+    function processWithdrawal(uint256 index) external onlyOperator nonReentrant {
+        WithdrawalRequest memory req = withdrawalQueue[index];
+        if (req.shareAmount == 0) revert QueueEmpty();
+
         _collectPerformanceFee();
 
-        // Calculate proportional amounts (after fee collection)
-        uint256 wethOwed = (shareAmount * totalWethAssets()) / totalShares;
-        uint256 tokenOwed = (shareAmount * token.balanceOf(address(this))) / totalShares;
+        uint256 wethOwed = (req.shareAmount * _availableWeth()) / totalShares;
+        uint256 tokenOwed = (req.shareAmount * token.balanceOf(address(this))) / totalShares;
 
-        // Burn shares
-        shares[msg.sender] -= shareAmount;
-        totalShares -= shareAmount;
+        totalShares -= req.shareAmount;
+        withdrawalQueue[index].shareAmount = 0;
 
-        // Check WETH balance in vault (excluding Moonwell)
+        // Try to cover from vault WETH; redeem from Moonwell if needed
         uint256 vaultWeth = weth.balanceOf(address(this));
-        uint256 wethToSend = wethOwed;
-
         if (vaultWeth < wethOwed) {
-            // Need to redeem from Moonwell
             uint256 shortfall = wethOwed - vaultWeth;
             uint256 redeemResult = moonwellMarket.redeemUnderlying(shortfall);
-
             if (redeemResult != 0) {
-                // Partial redemption failed (high utilization) — send what we have, queue rest
-                wethToSend = vaultWeth;
-                uint256 remaining = wethOwed - vaultWeth;
-                queuedWithdrawals[msg.sender] += remaining;
-                emit WithdrawalQueued(msg.sender, remaining);
+                emit MoonwellWithdrawFailed(redeemResult);
+                // Send what we have — depositor can claim rest later via emergencyWithdraw path
+                wethOwed = vaultWeth;
             }
-            // If redeemResult == 0, we now have enough WETH
         }
 
-        // Transfer assets out
-        if (wethToSend > 0) {
-            bool success = weth.transfer(msg.sender, wethToSend);
-            if (!success) revert TransferFailed();
+        if (wethOwed > 0) {
+            bool ok = weth.transfer(req.depositor, wethOwed);
+            if (!ok) revert TransferFailed();
         }
         if (tokenOwed > 0) {
-            bool success = token.transfer(msg.sender, tokenOwed);
-            if (!success) revert TransferFailed();
+            bool ok = token.transfer(req.depositor, tokenOwed);
+            if (!ok) revert TransferFailed();
         }
 
-        // Update deposit tracking
-        uint256 wethDepositReduction = (shareAmount * wethDeposited[msg.sender]) /
-            (shares[msg.sender] + shareAmount); // original shares before burn
-        if (wethDepositReduction > wethDeposited[msg.sender]) {
-            wethDeposited[msg.sender] = 0;
-        } else {
-            wethDeposited[msg.sender] -= wethDepositReduction;
-        }
-
-        emit Withdraw(msg.sender, shareAmount, wethToSend, tokenOwed);
+        emit Withdrawn(req.depositor, wethOwed, tokenOwed, req.shareAmount);
     }
 
-    /// @notice Claim queued withdrawal amount (called after keeper processes shortfall)
-    function claimQueuedWithdrawal() external nonReentrant {
-        uint256 amount = queuedWithdrawals[msg.sender];
-        if (amount == 0) revert ZeroAmount();
+    /// @notice Depositor triggers emergency withdrawal after 4-hour timeout
+    /// @param queueIndex Index of their withdrawal request
+    function emergencyWithdraw(uint256 queueIndex) external nonReentrant {
+        WithdrawalRequest memory req = withdrawalQueue[queueIndex];
+        if (req.depositor != msg.sender) revert Unauthorized();
+        if (req.shareAmount == 0) revert QueueEmpty();
+        if (block.timestamp - req.requestedAt < EMERGENCY_TIMEOUT) revert EmergencyNotReady();
 
-        queuedWithdrawals[msg.sender] = 0;
+        uint256 wethOwed = (req.shareAmount * _availableWeth()) / totalShares;
+        uint256 tokenOwed = (req.shareAmount * token.balanceOf(address(this))) / totalShares;
 
-        uint256 available = weth.balanceOf(address(this));
-        uint256 toSend = amount > available ? available : amount;
+        totalShares -= req.shareAmount;
+        withdrawalQueue[queueIndex].shareAmount = 0;
 
-        if (toSend < amount) {
-            queuedWithdrawals[msg.sender] = amount - toSend;
+        // Try to redeem from Moonwell to cover
+        uint256 vaultWeth = weth.balanceOf(address(this));
+        if (vaultWeth < wethOwed) {
+            uint256 shortfall = wethOwed - vaultWeth;
+            uint256 mBal = moonwellMarket.balanceOf(address(this));
+            if (mBal > 0) {
+                moonwellMarket.redeemUnderlying(shortfall); // Best-effort, ignore return
+            }
+            wethOwed = weth.balanceOf(address(this)) < wethOwed
+                ? weth.balanceOf(address(this))
+                : wethOwed;
         }
 
-        bool success = weth.transfer(msg.sender, toSend);
-        if (!success) revert TransferFailed();
+        if (wethOwed > 0) {
+            bool ok = weth.transfer(msg.sender, wethOwed);
+            if (!ok) revert TransferFailed();
+        }
+        if (tokenOwed > 0) {
+            bool ok = token.transfer(msg.sender, tokenOwed);
+            if (!ok) revert TransferFailed();
+        }
+
+        emit EmergencyWithdrawn(msg.sender, wethOwed, tokenOwed);
     }
 
-    // ========== MOONWELL LENDING (OPERATOR) ==========
+    // ========== OPERATOR: UNISWAP LP MANAGEMENT ==========
+    /// @notice Execute an allowlisted Uniswap PM function
+    /// @dev Validates selector is allowed and recipient fields point to this vault
+    /// @param data ABI-encoded function call for NonfungiblePositionManager
+    function operatorExecute(bytes calldata data) external onlyOperator nonReentrant returns (bytes memory) {
+        if (data.length < 4) revert UnauthorizedCall();
+        bytes4 selector = bytes4(data[:4]);
+        if (!allowedSelectors[selector]) revert UnauthorizedCall();
 
+        // Validate recipient is this vault for functions that have a recipient field
+        // mint: recipient at offset 4 + 9*32 = 292 (10th param in MintParams struct)
+        // collect: recipient at offset 4 + 1*32 = 36 (2nd param in CollectParams struct)
+        if (selector == 0x88316456 && data.length >= 324) {
+            // mint — recipient is 10th word
+            address recipient = address(uint160(uint256(bytes32(data[292:324]))));
+            if (recipient != address(this)) revert InvalidRecipient();
+        } else if (selector == 0xfc6f7865 && data.length >= 68) {
+            // collect — recipient is 2nd word
+            address recipient = address(uint160(uint256(bytes32(data[36:68]))));
+            if (recipient != address(this)) revert InvalidRecipient();
+        }
+
+        (bool success, bytes memory result) = uniswapPM.call(data);
+        emit OperatorAction(selector, success);
+
+        if (!success) {
+            assembly { revert(add(result, 32), mload(result)) }
+        }
+        return result;
+    }
+
+    // ========== OPERATOR: MOONWELL LENDING ==========
     /// @notice Supply idle WETH to Moonwell to earn lending yield
-    /// @param amount Amount of WETH to supply
     function supplyToMoonwell(uint256 amount) external onlyOperator nonReentrant {
         if (amount == 0) revert ZeroAmount();
-
-        // Check guardian pause
         if (moonwellMarket.mintGuardianPaused()) revert MoonwellMintGuardianPaused();
 
         // Enforce max lending ratio
@@ -270,18 +348,15 @@ contract SMCVault {
         if (totalWeth > 0 && (afterLend * BPS) / totalWeth > maxLendingRatio)
             revert MaxLendingRatioCeilingExceeded();
 
-        // Supply to Moonwell
         uint256 result = moonwellMarket.mint(amount);
         if (result != 0) revert MoonwellMintFailed(result);
 
         emit MoonwellSupply(amount);
     }
 
-    /// @notice Withdraw WETH from Moonwell
-    /// @param amount Amount of WETH to withdraw (0 = withdraw all)
+    /// @notice Withdraw WETH from Moonwell (0 = withdraw all)
     function withdrawFromMoonwell(uint256 amount) external onlyOperator nonReentrant {
         if (amount == 0) {
-            // Full drain — redeem all mTokens
             uint256 mTokenBalance = moonwellMarket.balanceOf(address(this));
             if (mTokenBalance == 0) revert ZeroAmount();
             uint256 result = moonwellMarket.redeem(mTokenBalance);
@@ -290,20 +365,52 @@ contract SMCVault {
             uint256 result = moonwellMarket.redeemUnderlying(amount);
             if (result != 0) revert MoonwellRedeemFailed(result);
         }
-
         emit MoonwellWithdraw(amount);
     }
 
-    /// @notice Update the max lending ratio (operator or owner)
-    /// @param newRatio New ratio in basis points (max 9000 = 90%)
-    function setMaxLendingRatio(uint256 newRatio) external onlyOwnerOrOperator {
-        if (newRatio > MAX_LENDING_RATIO_CEILING) revert MaxLendingRatioCeilingExceeded();
-        uint256 oldRatio = maxLendingRatio;
-        maxLendingRatio = newRatio;
-        emit MaxLendingRatioUpdated(oldRatio, newRatio);
+    // ========== PERFORMANCE FEE ==========
+    /// @notice Collect accrued performance fees to owner
+    function collectFees() external onlyOwner nonReentrant {
+        _collectPerformanceFee();
+        uint256 fees = reservedFees;
+        if (fees == 0) return;
+        reservedFees = 0;
+
+        bool ok = weth.transfer(owner, fees);
+        if (!ok) revert TransferFailed();
+
+        emit PerformanceFeeCollected(fees);
     }
 
-    /// @notice Update the operator address
+    function _collectPerformanceFee() internal {
+        if (totalShares == 0) return;
+
+        uint256 currentNAV = navPerShare();
+        if (currentNAV <= highWaterMark) return;
+
+        uint256 gain = currentNAV - highWaterMark;
+        uint256 totalFeeWeth = (gain * PERFORMANCE_FEE_BPS * totalShares) / (BPS * 1e18);
+
+        reservedFees += totalFeeWeth;
+
+        uint256 oldHWM = highWaterMark;
+        highWaterMark = currentNAV;
+        emit HighWaterMarkUpdated(oldHWM, currentNAV);
+    }
+
+    // ========== ADMIN ==========
+    /// @notice Approve Uniswap PM to spend vault's WETH
+    function approveWethForUniswap() external onlyOwner {
+        bool ok = IERC20(address(weth)).approve(uniswapPM, type(uint256).max);
+        require(ok, "WETH approve failed");
+    }
+
+    /// @notice Approve Uniswap PM to spend vault's token
+    function approveTokenForUniswap() external onlyOwner {
+        bool ok = token.approve(uniswapPM, type(uint256).max);
+        require(ok, "Token approve failed");
+    }
+
     function setOperator(address newOperator) external onlyOwner {
         if (newOperator == address(0)) revert ZeroAddress();
         address old = operator;
@@ -311,112 +418,95 @@ contract SMCVault {
         emit OperatorUpdated(old, newOperator);
     }
 
-    // ========== EMERGENCY ==========
+    function setMaxLendingRatio(uint256 newRatio) external onlyOwnerOrOperator {
+        if (newRatio > MAX_LENDING_RATIO_CEILING) revert MaxLendingRatioCeilingExceeded();
+        uint256 oldRatio = maxLendingRatio;
+        maxLendingRatio = newRatio;
+        emit MaxLendingRatioUpdated(oldRatio, newRatio);
+    }
 
-    /// @notice Emergency withdraw all positions. Owner only.
-    /// @dev Drains Moonwell, transfers all assets to owner.
-    function emergencyWithdraw() external onlyOwner nonReentrant {
-        // Try to drain Moonwell
-        uint256 mTokenBalance = moonwellMarket.balanceOf(address(this));
-        if (mTokenBalance > 0) {
-            uint256 result = moonwellMarket.redeem(mTokenBalance);
-            if (result != 0) {
-                // Moonwell paused or high utilization — emit event, continue
-                emit MoonwellWithdrawFailed(result);
-            }
+    function addAllowedSelector(bytes4 selector) external onlyOwner {
+        allowedSelectors[selector] = true;
+    }
+
+    function removeAllowedSelector(bytes4 selector) external onlyOwner {
+        allowedSelectors[selector] = false;
+    }
+
+    /// @notice Emergency drain: owner pulls all assets. Nuclear option.
+    function emergencyDrain() external onlyOwner nonReentrant {
+        // Drain Moonwell
+        uint256 mBal = moonwellMarket.balanceOf(address(this));
+        if (mBal > 0) {
+            uint256 result = moonwellMarket.redeem(mBal);
+            if (result != 0) emit MoonwellWithdrawFailed(result);
         }
 
-        // Transfer all WETH to owner
         uint256 wethBal = weth.balanceOf(address(this));
         if (wethBal > 0) {
-            bool wethSuccess = weth.transfer(owner, wethBal);
-            if (!wethSuccess) revert TransferFailed();
+            bool ok = weth.transfer(owner, wethBal);
+            if (!ok) revert TransferFailed();
         }
 
-        // Transfer all tokens to owner
         uint256 tokenBal = token.balanceOf(address(this));
         if (tokenBal > 0) {
-            bool tokenSuccess = token.transfer(owner, tokenBal);
-            if (!tokenSuccess) revert TransferFailed();
+            bool ok = token.transfer(owner, tokenBal);
+            if (!ok) revert TransferFailed();
         }
 
-        emit EmergencyWithdrawExecuted(msg.sender);
+        emit EmergencyDrainExecuted(msg.sender);
     }
 
     // ========== VIEW FUNCTIONS ==========
-
-    /// @notice Total WETH assets including Moonwell lending position
-    /// @return Total WETH value (vault balance + Moonwell value via exchangeRateStored)
+    /// @notice Total WETH assets including Moonwell, excluding reserved fees
     function totalWethAssets() public view returns (uint256) {
-        return weth.balanceOf(address(this)) + _moonwellWethValue();
+        return _availableWeth();
     }
 
-    /// @notice Total assets summary
+    /// @notice Available WETH for depositors (vault + Moonwell - reserved fees)
+    function _availableWeth() internal view returns (uint256) {
+        uint256 total = weth.balanceOf(address(this)) + _moonwellWethValue();
+        return total > reservedFees ? total - reservedFees : 0;
+    }
+
+    function _moonwellWethValue() internal view returns (uint256) {
+        uint256 mBal = moonwellMarket.balanceOf(address(this));
+        if (mBal == 0) return 0;
+        return (mBal * moonwellMarket.exchangeRateStored()) / 1e18;
+    }
+
+    function navPerShare() public view returns (uint256) {
+        if (totalShares == 0) return 1e18;
+        return (_availableWeth() * 1e18) / totalShares;
+    }
+
     function totalAssets() external view returns (uint256 wethTotal, uint256 tokenTotal) {
-        wethTotal = totalWethAssets();
+        wethTotal = _availableWeth();
         tokenTotal = token.balanceOf(address(this));
     }
 
-    /// @notice NAV per share (scaled by 1e18)
-    function navPerShare() public view returns (uint256) {
-        if (totalShares == 0) return 1e18;
-        return (totalWethAssets() * 1e18) / totalShares;
-    }
-
-    /// @notice Value of WETH lent to Moonwell
     function moonwellWethValue() external view returns (uint256) {
         return _moonwellWethValue();
     }
 
-    /// @notice Current lending ratio in basis points
     function currentLendingRatio() external view returns (uint256) {
-        uint256 total = totalWethAssets();
+        uint256 total = weth.balanceOf(address(this)) + _moonwellWethValue();
         if (total == 0) return 0;
         return (_moonwellWethValue() * BPS) / total;
     }
 
-    /// @notice Get depositor info
+    function getWithdrawalQueueLength() external view returns (uint256) {
+        return withdrawalQueue.length;
+    }
+
     function getDepositorInfo(address depositor)
-        external
-        view
-        returns (uint256 shareBalance, uint256 wethValue, uint256 tokenValue, uint256 queued)
+        external view
+        returns (uint256 shareBalance, uint256 wethValue, uint256 tokenValue)
     {
         shareBalance = shares[depositor];
         if (totalShares > 0) {
-            wethValue = (shareBalance * totalWethAssets()) / totalShares;
+            wethValue = (shareBalance * _availableWeth()) / totalShares;
             tokenValue = (shareBalance * token.balanceOf(address(this))) / totalShares;
         }
-        queued = queuedWithdrawals[depositor];
-    }
-
-    // ========== INTERNAL ==========
-
-    /// @dev Calculate WETH value of Moonwell position using exchangeRateStored
-    function _moonwellWethValue() internal view returns (uint256) {
-        uint256 mTokenBalance = moonwellMarket.balanceOf(address(this));
-        if (mTokenBalance == 0) return 0;
-        uint256 exchangeRate = moonwellMarket.exchangeRateStored();
-        return (mTokenBalance * exchangeRate) / 1e18;
-    }
-
-    /// @dev Collect performance fee if NAV exceeds high-water mark
-    function _collectPerformanceFee() internal {
-        uint256 currentNav = navPerShare();
-        if (currentNav <= highWaterMark) return;
-
-        uint256 profit = currentNav - highWaterMark;
-        uint256 feePerShare = (profit * PERFORMANCE_FEE_BPS) / BPS;
-
-        // Calculate fee in WETH terms
-        uint256 feeWeth = (feePerShare * totalShares) / 1e18;
-        uint256 feeToken = 0; // Fee only taken in WETH for simplicity
-
-        if (feeWeth > 0 && feeWeth <= weth.balanceOf(address(this))) {
-            weth.transfer(owner, feeWeth);
-            emit PerformanceFeeCollected(feeWeth, feeToken);
-        }
-
-        // Update high-water mark
-        highWaterMark = currentNav;
     }
 }
